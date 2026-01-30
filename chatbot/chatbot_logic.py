@@ -50,8 +50,16 @@ class ERPBot:
             return f"Hello {faculty_name} 👋, What would you like me to help you with today?"
         
         # 1. Detect IDs (Registration Numbers or Codes)
-        # Match numeric IDs (like 101) or alphanumeric registration numbers (like 21CS001)
-        student_identifiers = re.findall(r'\b(\d{3,}|\d+[A-Z]+\d+)\b', query.upper())
+        # Match numeric IDs (like 101) or alphanumeric registration numbers (like 21CS001), 
+        # BUT IGNORE 4-digit numbers if they look like years (e.g. 2024 batch) or are specifically 'batch 2024'
+        # We'll use a negative lookaround or just filter the results list
+        raw_identifiers = re.findall(r'\b(\d{3,}|\d+[A-Z]+\d+)\b', query.upper())
+        student_identifiers = []
+        for id_val in raw_identifiers:
+            # If it's a 4-digit number and "batch" or "year" is in query, assume it's a year, not ID
+            if len(id_val) == 4 and id_val.startswith("20") and ("batch" in query.lower() or "year" in query.lower()):
+                continue
+            student_identifiers.append(id_val)
         
         # Guard clause: "class report", "class analysis" - Pre-calculation
         is_report_query = any(k in query for k in ["report", "analysis", "performance", "stats", "statistics", "marks", "scores", "results", "summary"])
@@ -81,12 +89,16 @@ class ERPBot:
             return "No regulations found."
 
         # 3. Intent: List Students
-        list_keywords = ["my students", "list students", "list my students", "show my students", "assigned students", "mentees", "mentors", "mentor", "mentee", "advisor", "ca", "class", "show students", "list all students", "all students", "students in", "students of"]
+        list_keywords = ["my students", "list students", "list my students", "show my students", "assigned students", "mentees", "mentors", "mentor", "mentee", "advisor", "ca", "class", "show students", "list all students", "all students", "students in", "students of", "list the student", "list the students"]
         
         # Guard clause: "class report", "class analysis" should NOT be caught here.
         # is_report_query is pre-calculated above
         
-        if any(k in query for k in list_keywords) and not is_report_query:
+        # Check if list intent OR clear batch intent (implicit list)
+        has_list_keyword = any(k in query for k in list_keywords)
+        has_batch_intent = "batch" in query.lower() and "student" in query.lower()
+        
+        if (has_list_keyword or has_batch_intent) and not is_report_query:
              target_role = None
              target_dept = None
              target_batch = None
