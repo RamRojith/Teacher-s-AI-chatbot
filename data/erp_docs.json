@@ -1,0 +1,29 @@
+{
+    "login_help": {
+        "keywords": [
+            "login",
+            "sign in",
+            "access",
+            "credential"
+        ],
+        "response": "To log in to the ERP system:\n1. Go to the ERP portal URL.\n2. Enter your Faculty ID and Password.\n3. Click 'Login'.\n\nIf you face issues, check your internet connection or clear browser cache."
+    },
+    "password_reset": {
+        "keywords": [
+            "reset",
+            "forgot",
+            "change password",
+            "password"
+        ],
+        "response": "To reset your password:\n1. Click on 'Forgot Password' on the login page.\n2. Enter your registered email.\n3. Follow the link sent to your email to set a new password.\n\nNote: You cannot reuse the last 3 passwords."
+    },
+    "access_denied": {
+        "keywords": [
+            "denied",
+            "permission",
+            "authorized",
+            "role"
+        ],
+        "response": "If you see 'Access Denied':\n1. Ensure you are logging in with the correct role (Teacher vs Admin).\n2. Contact the IT Helpdesk at ext 101 if the issue persists."
+    }
+}
