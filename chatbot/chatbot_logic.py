@@ -45,9 +45,32 @@ class ERPBot:
         if is_first_message:
             return f"Hello {faculty_name} 👋\nWhat would you like me to help you with today?"
 
-        # 0.1 Subsequent Optional Greetings (No authorization details)
-        if any(word in query for word in ["hi", "hello", "hey", "start", "good morning", "good afternoon", "good evening"]):
-            return f"Hello {faculty_name} 👋, What would you like me to help you with today?"
+        # 0.1 Diverse Greeting & Help Logic
+        greeting_keywords = ["hi", "hello", "hey", "start", "good morning", "good afternoon", "good evening", "greetings"]
+        help_keywords = ["help", "what can you do", "can you help", "how to use", "guide", "who are you"]
+        
+        is_greeting = any(word in query for word in greeting_keywords)
+        is_help_request = any(phrase in query for phrase in help_keywords)
+
+        if is_greeting or is_help_request:
+            # Time-aware greetings
+            hour = datetime.now().hour
+            time_msg = "Good morning" if 5 <= hour < 12 else "Good afternoon" if 12 <= hour < 17 else "Good evening" if 17 <= hour < 22 else "Hello"
+            
+            greetings = [
+                f"{time_msg} {faculty_name} 👋! I'm your ERP Assistant. How can I assist you today?",
+                f"Greetings {faculty_name}! I'm here to help you with student data and reports. What would you like to know?",
+                f"Hello {faculty_name} 👋! As your ERP Assistant, I'm ready to help. What's on your mind?",
+                f"Hi {faculty_name}, it's good to see you. How can I make your tasks easier today?",
+                f"Hello {faculty_name}! Managing your {active_role} duties? Let me know if you need any student information or reports.",
+                f"Hello {faculty_name} 👋! What can I do for you today? I have all the latest student statistics ready.",
+                f"Hi {faculty_name}! Your ERP Assistant is at your service. How's your day going?",
+                f"Hello {faculty_name}! Looking for specific student data or a class analysis today?",
+                f"Greetings {faculty_name}! Let me know how I can help with your academic tracking today."
+            ]
+            # Use random.sample to avoid picking the same one if possible in a single session 
+            # (though with multiple requests this is hard without state)
+            return random.choice(greetings)
         
         # 1. Detect IDs (Registration Numbers or Codes)
         # Match numeric IDs (like 101) or alphanumeric registration numbers (like 21CS001), 
@@ -89,7 +112,7 @@ class ERPBot:
             return "No regulations found."
 
         # 3. Intent: List Students
-        list_keywords = ["my students", "list students", "list my students", "show my students", "assigned students", "mentees", "mentors", "mentor", "mentee", "advisor", "ca", "class", "show students", "list all students", "all students", "students in", "students of", "list the student", "list the students"]
+        list_keywords = ["my students", "list students", "list of students", "list my students", "show my students", "assigned students", "mentees", "mentors", "mentor", "mentee", "advisor", "ca", "class", "show students", "list all students", "all students", "students in", "students of", "students for", "list the student", "list the students"]
         
         # Guard clause: "class report", "class analysis" should NOT be caught here.
         # is_report_query is pre-calculated above
@@ -103,12 +126,8 @@ class ERPBot:
              target_dept = None
              target_batch = None
              
-             # Extract Department if mentioned
-             depts = Add_Department.objects.all()
-             for d in depts:
-                 if d.Department and d.Department.lower() in query:
-                     target_dept = d
-                     break
+             # Use robust department extraction
+             target_dept = self._extract_department(query)
             
              # Extract Batch if mentioned (e.g. "2024 batch", "batch 2024", "students of 2024")
              # Look for 4 digit year starting with 20
@@ -213,13 +232,15 @@ class ERPBot:
                 
                 students = StudentDetails.objects.filter(department=dept)
                 
+                limit_str = ""
                 if target_batch:
                     students = students.filter(batch=target_batch)
                     limit_str = f" (Batch {target_batch})"
-                else:
-                    limit_str = ""
+                
+                if not students.exists():
+                     return f"No students found in {dept.Department}{limit_str}."
 
-                student_list = "\n".join([f"- {s.name} ({s.reg_no})" for s in students[:60]])
+                student_list = "\n".join([f"- {s.name} ({s.reg_no})" for s in students[:100]])
                 return f"🏢 **HOD View: {dept.Department}{limit_str}**:\n\n{student_list}\n\nTotal: {students.count()}"
 
             # Faculty/Advisor/Mentor Logic: Only assigned students
@@ -316,8 +337,8 @@ class ERPBot:
 
     def _handle_student_query(self, faculty_id, student_reg_no, query, active_role):
         try:
-            # Match by reg_no in StudentDetails
-            student = StudentDetails.objects.filter(reg_no__icontains=student_reg_no).first()
+            # Match by reg_no in StudentDetails (Strict exact match)
+            student = StudentDetails.objects.filter(reg_no__iexact=student_reg_no).first()
             if not student:
                  return f"Student with Registration Number '{student_reg_no}' not found."
             
@@ -485,46 +506,80 @@ Generate the report."""
         return resp
 
     def _handle_class_report(self, faculty_id, subject_query="", active_role=None):
-        # Role Check
-        if active_role not in ['Teacher', 'Faculty', 'Advisor', 'HOD', 'Vice Principal']:
-            return "I’m unable to provide that information under your current role selection."
-        try:
-            # Authorization and Subject Scope (ERP logic)
-            # Vice Principal can view any subject
-            if active_role == 'Vice Principal':
-                if not subject_query:
-                    return "Please specify a subject for the class report. (e.g., 'Class report for Physics')"
-                alloc = AssignSubjectFaculty.objects.filter(course__title__icontains=subject_query).first()
-                if not alloc:
-                    return f"No allocation or course records found for '{subject_query}'."
-            else:
-                # Find the most relevant allocation for this teacher/subject
-                # Using faculty_id directly in filters
-                alloc_qs = AssignSubjectFaculty.objects.filter(faculty_id=faculty_id)
-                if subject_query:
-                    alloc_qs = alloc_qs.filter(course__title__icontains=subject_query)
-                
-                alloc = alloc_qs.first()
-                if not alloc:
-                    if subject_query:
-                        return f"No allocation found for subject '{subject_query}' for you."
-                    return "No subject allocations found for you."
+        # 1. Subject Requirement & Validation
+        if not subject_query or len(subject_query.strip()) < 2:
+            return "⚠️ Please explicitly mention the subject name to generate a class report. (e.g., 'Class report for Physics')"
 
-            dept = alloc.department
-            batch = alloc.batch
-            section = alloc.section
-            course = alloc.course
+        # Role Check (Authorized roles)
+        authorized_roles = ['Teacher', 'Faculty', 'Advisor', 'CA', 'HOD', 'Mentor', 'Vice Principal']
+        if active_role not in authorized_roles:
+            return "I’m unable to provide that information under your current role selection."
+
+        try:
+            # Get Faculty Info
+            faculty_info = self._get_faculty_info(faculty_id)
+            if not faculty_info:
+                return "❌ Error: Could not find your faculty record."
+
+            # 2. Subject Validation (Strict match against Course table)
+            course = Course.objects.filter(Q(title__icontains=subject_query) | Q(course_code__iexact=subject_query)).first()
+            if not course:
+                return f"⚠️ Subject '{subject_query}' not found. Please enter a valid subject name."
+
+            # 3. Access Control & Student Filtering
+            students = StudentDetails.objects.none()
+            scope_label = "Unknown"
+
+            if active_role == 'Vice Principal':
+                students = StudentDetails.objects.all()
+                scope_label = "Institutional (VP)"
             
-            students = StudentDetails.objects.filter(department=dept, batch=batch, section=section)
+            elif active_role == 'HOD':
+                dept = faculty_info.department
+                if not dept: return "⚠️ Access Denied: No department assigned to your HOD profile."
+                students = StudentDetails.objects.filter(department=dept)
+                scope_label = f"Department: {dept.Department}"
+
+            elif active_role in ['Advisor', 'CA']:
+                # CA can only see their class
+                students = StudentDetails.objects.filter(ca_id=str(faculty_info.id))
+                if students.exists():
+                    s = students.first()
+                    scope_label = f"Class: {s.department.Department if s.department else 'N/A'} - {s.batch} ({s.section})"
+                else:
+                    scope_label = "Class: Assigned Students"
+
+            elif active_role == 'Mentor':
+                # Mentor can only see their mentees
+                students = StudentDetails.objects.filter(mentor_id=str(faculty_info.id))
+                scope_label = "Mentorship: Assigned Mentees"
+
+            elif active_role in ['Teacher', 'Faculty']:
+                # Teachers see the class they are allocated to for this subject
+                alloc = AssignSubjectFaculty.objects.filter(faculty_id=faculty_id, course=course).first()
+                if not alloc:
+                    # Alternative: If no direct allocation, check if they have any assigned students
+                    students = StudentDetails.objects.filter(ca_id=str(faculty_info.id))
+                    if not students.exists():
+                        return f"❌ You are not allocated to teach {course.title} or assigned to a class."
+                    scope_label = "Faculty: Assigned Class"
+                else:
+                    students = StudentDetails.objects.filter(department=alloc.department, batch=alloc.batch, section=alloc.section)
+                    scope_label = f"Class: {alloc.department.Department if alloc.department else 'N/A'} - {alloc.batch} ({alloc.section})"
+
+            if not students.exists():
+                return f"No students found for subject '{course.title}' under your current role."
+
+            # 4. Data Retrieval & Formatting (Predefined Format)
             marks = AssessmentMark.objects.filter(student__in=students, assessment__course=course)
             
             if not marks.exists():
-                return f"No assessment marks available for {course.title} in {dept.Department if dept else 'N/A'} (Batch: {batch}, Section: {section})."
+                return f"No assessment marks available for {course.title} for the selected group."
             
             stats = marks.aggregate(avg=Avg('marks_raw'), highest=Max('marks_raw'), lowest=Min('marks_raw'))
             
             resp = f"📊 **ERP Class Performance: {course.title}**\n"
-            resp += f"📍 **Scope**: {dept.Department if dept else 'N/A'} - Batch {batch} (Sec: {section})\n"
+            resp += f"📍 **Scope**: {scope_label}\n"
             resp += f"🔹 Average: {float(stats['avg'] or 0):.1f}\n"
             resp += f"🔹 Highest: {float(stats['highest'] or 0)}\n"
             resp += f"🔹 Lowest: {float(stats['lowest'] or 0)}\n\n"
@@ -539,7 +594,14 @@ Generate the report."""
                 g_avg = gender_marks.aggregate(Avg('marks_raw'))['marks_raw__avg']
                 g_total = gender_group.count()
                 
-                top_3 = gender_marks[:3]
+                # Deduplicate marks by student to get top 3 unique students
+                seen_students = set()
+                top_3 = []
+                for m in gender_marks:
+                    if m.student_id not in seen_students:
+                        top_3.append(m)
+                        seen_students.add(m.student_id)
+                    if len(top_3) == 3: break
 
                 report = f"**{gender_label} Performance ({g_total} students):**\n"
                 report += "Top Scorers:\n"
@@ -655,6 +717,70 @@ Generate the report."""
         except Exception as e:
             return f"Error in marks processing: {str(e)}"
 
+    def _extract_department(self, query):
+        """
+        Robustly extracts department from query using aliases and keyword matching.
+        """
+        # Normalize: replace symbols with spaces and lowercase
+        clean_query = re.sub(r'[^a-zA-Z0-9\s]', ' ', query.lower())
+        
+        # 1. Alias Mapping
+        aliases = {
+            'ml': 'Computer Science and Engineering (AIML)',
+            'machine learning': 'Computer Science and Engineering (AIML)',
+            'aiml': 'Computer Science and Engineering (AIML)',
+            'ai & ds': 'Artificial Intelligence and Data Science',
+            'ai&ds': 'Artificial Intelligence and Data Science',
+            'ai and ds': 'Artificial Intelligence and Data Science',
+            'aids': 'Artificial Intelligence and Data Science',
+            'ai': 'Artificial Intelligence and Data Science',
+            'ds': 'Artificial Intelligence and Data Science',
+            'data science': 'Artificial Intelligence and Data Science',
+            'csbs': 'Computer Science and Business Systems',
+            'cse': 'Computer Science and Engineering',
+            'it': 'Information Technology',
+            'ece': 'Electronics and Communication Engineering',
+            'eee': 'Electrical and Electronics Engineering',
+            'mech': 'Mechanical Engineering',
+            'civil': 'Civil Engineering',
+        }
+
+        # Check for aliases first
+        for alias, full_name in aliases.items():
+            if f" {alias} " in f" {clean_query} " or clean_query.startswith(f"{alias} ") or clean_query.endswith(f" {alias}"):
+                return Add_Department.objects.filter(Department__iexact=full_name).first()
+
+        # 2. Sequential Keyword Matching
+        dept_matches = []
+        depts = Add_Department.objects.all()
+        for d in depts:
+            if not d.Department: continue
+            d_name = d.Department.lower()
+            d_clean = re.sub(r'[^a-zA-Z0-9\s]', ' ', d_name)
+            
+            # Full name match
+            if d_name in clean_query:
+                return d
+            
+            # Keyword matching
+            keywords = d_clean.replace('and', '').replace('&', '').split()
+            significant_keywords = [k for k in keywords if len(k) > 3]
+            
+            if significant_keywords:
+                # If ALL keywords match
+                if all(sk in clean_query for sk in significant_keywords):
+                    return d
+                # If at least one LONG keyword matches (unlikely to be a filler)
+                for sk in significant_keywords:
+                    if len(sk) >= 8 and sk in clean_query:
+                        dept_matches.append(d)
+                        break
+        
+        if dept_matches:
+            return dept_matches[0] # Return first match for now
+                    
+        return None
+
     def _get_faculty_info(self, faculty_id):
         """
         Robust helper to find faculty record across databases and handle ID inconsistencies.
@@ -671,15 +797,51 @@ Generate the report."""
                 if f: return f
             except: pass
 
-            # 3. Approval System Fallback + Name Bridge
+            # 3. Approval System Fallback + Name Bridge with Department context
             from django.db import connections
             with connections['approval_system'].cursor() as cursor:
-                cursor.execute("SELECT username FROM control_room_user WHERE Employee_id = %s OR username = %s LIMIT 1", [faculty_id, faculty_id])
+                # Use a join to get department name from approval system
+                cursor.execute("""
+                    SELECT u.username, d.Department 
+                    FROM control_room_user u
+                    LEFT JOIN control_room_department d ON u.Department_id = d.id
+                    WHERE u.Employee_id = %s OR u.username = %s 
+                    LIMIT 1
+                """, [faculty_id, faculty_id])
                 row = cursor.fetchone()
-                if row and row[0]:
-                    name = row[0].strip()
+                
+                if row:
+                    username = row[0].strip()
+                    approval_dept_name = row[1].strip() if row[1] else None
+                    
                     # Bridge: Use name from approval DB to find ERP info
-                    f = FacultyManagementGeneralInformation.objects.filter(name__iexact=name).first()
+                    f = FacultyManagementGeneralInformation.objects.filter(name__iexact=username).first()
+                    
+                    # CRITICAL FIX: If name bridge matched someone in a different department,
+                    # or if no ERP record found, try to resolve the department object.
+                    if approval_dept_name:
+                        erp_dept = self._extract_department(approval_dept_name)
+                        if erp_dept:
+                            if not f:
+                                # Create a mock faculty object or handle appropriately
+                                # For now, we try to see if there's any record matching name AND dept
+                                f = FacultyManagementGeneralInformation.objects.filter(name__iexact=username, department=erp_dept).first()
+                                if not f:
+                                    # Still not found? Create a transient object with the correct dept
+                                    # to allow the HOD logic to proceed.
+                                    # (This avoids creating a DB record)
+                                    class TransientFaculty:
+                                        def __init__(self, name, dept):
+                                            self.name = name
+                                            self.department = dept
+                                            self.id = 0
+                                            self.faculty_id = 0
+                                    return TransientFaculty(username, erp_dept)
+                            else:
+                                # If the name-based match has a DIFFERENT department than what the approval system says,
+                                # trust the approval system and override the department for this session.
+                                f.department = erp_dept
+                    
                     return f
         except Exception as e:
             print(f"Robust faculty lookup error: {str(e)}")

@@ -32,19 +32,25 @@ def login_view(request):
             rows = cursor.fetchall()
             
             if rows:
-                # Check password using the first entry (all should have same password)
-                stored_pass, employee_id, ext_username, _, _ = rows[0]
-                
+                # Iterate through all entries to find one with a matching hashed password
                 password_valid = False
-                if stored_pass == password:  # Plain text match
-                    password_valid = True
-                else:
+                matched_row = None
+                
+                for row in rows:
+                    stored_pass, employee_id, ext_username, _, _ = row
                     try:
-                        password_valid = check_password(password, stored_pass)
-                    except:
-                        password_valid = False
+                        if check_password(password, stored_pass):
+                            password_valid = True
+                            matched_row = row
+                            break
+                    except Exception:
+                        # Skip entries that aren't valid Django hashes
+                        continue
                 
                 if password_valid:
+                    # Use info from the matching row
+                    stored_pass, employee_id, ext_username, _, _ = matched_row
+                    
                     # Collect all roles for this Employee_id
                     all_roles = []
                     for row in rows:
@@ -53,7 +59,7 @@ def login_view(request):
                             all_roles.append(role_name)
                     
                     # Determine primary role (highest priority)
-                    # Priority: HOD > Advisor > Mentor > Faculty > Teacher > Staff
+                    # Priority: VP > HOD > Advisor > Mentor > Faculty > Teacher > Staff
                     role_priority = {
                         'Vice Principal': 0,
                         'HOD': 1,
@@ -70,9 +76,7 @@ def login_view(request):
                         primary_role = sorted_roles[0]
                     
                     # CRITICAL: Fetch faculty name from ERP system (same table chatbot uses)
-                    # Try multiple lookup strategies to ensure we find the record
                     from .models import FacultyManagementGeneralInformation
-                    from django.db.models import Q
                     
                     faculty_name = None
                     try:
@@ -90,8 +94,6 @@ def login_view(request):
                         # Extract and validate name
                         if faculty_record and faculty_record.name:
                             faculty_name = faculty_record.name.strip()
-                            if not faculty_name:  # Empty after strip
-                                faculty_name = None
                     except Exception as lookup_err:
                         print(f"Faculty name lookup error for employee_id {employee_id}: {lookup_err}")
                     
