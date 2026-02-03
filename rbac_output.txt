@@ -1,0 +1,25 @@
+Dept A: 1 - Artificial Intelligence and Data Science
+Dept B: 2 - Information Technology
+Sample Student (Dept A): MATHAN KUMAR M (953624243051)
+Sample Faculty (Dept B): sakkaravarthi (ID: 1705)
+Sample Student (Dept B): JAYADEEP R (953623244018)
+
+--- Test 1: Teacher (Information Technology) querying Student (Artificial Intelligence and Data Science) ---
+Response: Access Denied: You are not assigned to Artificial Intelligence and Data Science - Section B.
+Actually assigned in DB? False
+
+--- Test 2: HOD (Information Technology) querying Student (Artificial Intelligence and Data Science) ---
+Response: IÆm unable to provide that information under your current role selection.
+
+--- Test 3: HOD (Information Technology) listing Artificial Intelligence and Data Science Students ---
+Traceback (most recent call last):
+  File "C:\Users\ramro\OneDrive\Documents\chatbot for teacher\test_rbac_check.py", line 79, in <module>
+    test_rbac()
+    ~~~~~~~~~^^
+  File "C:\Users\ramro\OneDrive\Documents\chatbot for teacher\test_rbac_check.py", line 76, in test_rbac
+    print(f"Response: {response}")
+    ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ramro\AppData\Local\Programs\Python\Python313\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 10-11: character maps to <undefined>
