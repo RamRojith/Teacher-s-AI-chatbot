@@ -328,3 +328,59 @@ class FacultyManagementGeneralInformation(models.Model):
 
     def __str__(self):
         return self.name or "Unnamed Faculty"
+
+# --- Approval System / Control Room Models ---
+
+class ControlRoomRole(models.Model):
+    id = models.IntegerField(primary_key=True)
+    role = models.CharField(max_length=255)
+
+    class Meta:
+        managed = False
+        db_table = 'control_room_role'
+        app_label = 'chatbot'
+
+class ControlRoomDepartment(models.Model):
+    id = models.IntegerField(primary_key=True)
+    department = models.CharField(max_length=255)
+
+    class Meta:
+        managed = False
+        db_table = 'add_department'
+        app_label = 'chatbot'
+
+class ControlRoomUser(models.Model):
+    id = models.IntegerField(primary_key=True)
+    Employee_id = models.CharField(max_length=255)
+    username = models.CharField(max_length=255)
+    password = models.CharField(max_length=255)
+    role = models.ForeignKey(ControlRoomRole, on_delete=models.DO_NOTHING, db_column='role_id')
+    department = models.ForeignKey(ControlRoomDepartment, on_delete=models.DO_NOTHING, db_column='dept_id', null=True)
+    is_active = models.IntegerField()
+
+    class Meta:
+        managed = False
+        db_table = 'control_room_user'
+        app_label = 'chatbot'
+
+# --- Dashboard & Performance Models ---
+
+class StudentDashboardStats(models.Model):
+    student = models.OneToOneField(Student, on_delete=models.CASCADE, related_name='dashboard_stats')
+    gpa = models.DecimalField(max_digits=4, decimal_places=2, default=0.0)
+    achievements = models.IntegerField(default=0)
+    co_curricular = models.IntegerField(default=0)
+    publications = models.IntegerField(default=0)
+    projects = models.IntegerField(default=0)
+
+    class Meta:
+        verbose_name_plural = "Student Dashboard Stats"
+
+class Attendance(models.Model):
+    student = models.ForeignKey(Student, on_delete=models.CASCADE, related_name='attendance_records')
+    date = models.DateField()
+    status = models.CharField(max_length=20, choices=[('Present', 'Present'), ('Absent', 'Absent'), ('Late', 'Late')])
+    subject = models.CharField(max_length=100)
+
+    class Meta:
+        verbose_name_plural = "Attendance"
