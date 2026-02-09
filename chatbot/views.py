@@ -10,8 +10,9 @@ from django.contrib.auth import authenticate
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
 
-from django.db import connections
 from django.contrib.auth.hashers import check_password
+from django.db.models import Q
+from .models import ControlRoomUser, FacultyManagementGeneralInformation
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -21,98 +22,87 @@ def login_view(request):
     
     # 1. Try External Approval System Database
     try:
-        with connections['approval_system'].cursor() as cursor:
-            # Fetch ALL role entries for this user (same Employee_id can have multiple roles)
-            cursor.execute("""
-                SELECT u.password, u.Employee_id, u.username, r.role, u.id
-                FROM control_room_user u
-                LEFT JOIN control_room_role r ON u.role_id = r.id
-                WHERE (u.username = %s OR u.Employee_id = %s) AND u.is_active = 1
-            """, [username, username])
-            rows = cursor.fetchall()
-            
-            if rows:
-                # Iterate through all entries to find one with a matching hashed password
-                password_valid = False
-                matched_row = None
-                
-                for row in rows:
-                    stored_pass, employee_id, ext_username, _, _ = row
-                    try:
-                        if check_password(password, stored_pass):
-                            password_valid = True
-                            matched_row = row
-                            break
-                    except Exception:
-                        # Skip entries that aren't valid Django hashes
-                        continue
-                
-                if password_valid:
-                    # Use info from the matching row
-                    stored_pass, employee_id, ext_username, _, _ = matched_row
-                    
-                    # Collect all roles for this Employee_id
-                    all_roles = []
-                    for row in rows:
-                        role_name = row[3]
-                        if role_name:
-                            all_roles.append(role_name)
-                    
-                    # Determine primary role (highest priority)
-                    # Priority: VP > HOD > Advisor > Mentor > Faculty > Teacher > Staff
-                    role_priority = {
-                        'Vice Principal': 0,
-                        'HOD': 1,
-                        'Advisor': 2,
-                        'Mentor': 3,
-                        'Faculty': 4,
-                        'Teacher': 5,
-                        'Staff': 6
-                    }
-                    
-                    primary_role = 'Faculty'  # Default
-                    if all_roles:
-                        sorted_roles = sorted(all_roles, key=lambda r: role_priority.get(r, 99))
-                        primary_role = sorted_roles[0]
-                    
-                    # CRITICAL: Fetch faculty name from ERP system (same table chatbot uses)
-                    from .models import FacultyManagementGeneralInformation
-                    
-                    faculty_name = None
-                    try:
-                        # Strategy 1: By employee_id (faculty_id field)
-                        faculty_record = FacultyManagementGeneralInformation.objects.filter(faculty_id=employee_id).first()
-                        
-                        # Strategy 2: By primary key if employee_id is numeric
-                        if not faculty_record:
-                            try:
-                                emp_pk = int(employee_id)
-                                faculty_record = FacultyManagementGeneralInformation.objects.filter(id=emp_pk).first()
-                            except (ValueError, TypeError):
-                                pass
-                        
-                        # Extract and validate name
-                        if faculty_record and faculty_record.name:
-                            faculty_name = faculty_record.name.strip()
-                    except Exception as lookup_err:
-                        print(f"Faculty name lookup error for employee_id {employee_id}: {lookup_err}")
-                    
-                    # Fallback to username from control_room_user only if no ERP record found
-                    if not faculty_name:
-                        faculty_name = ext_username or None
-                    
-                    # AUTHENTICATION FAILURE: Name is mandatory
-                    if not faculty_name:
-                        return Response({
-                            'error': f'Authentication Error: Unable to retrieve profile information for ID {employee_id}. Please contact administrator.'
-                        }, status=500)
-                    
+        # Fetch ALL role entries for this user (same Employee_id can have multiple roles)
+        candidates = ControlRoomUser.objects.using('approval_system').filter(
+            Q(username=username) | Q(Employee_id=username),
+            is_active=1
+        ).select_related('role', 'department')
+
+        if candidates.exists():
+            matched_user = None
+            for user in candidates:
+                try:
+                    if check_password(password, user.password):
+                        matched_user = user
+                        break
+                except Exception:
+                    # Skip entries that aren't valid Django hashes
+                    continue
+
+            if matched_user:
+                employee_id = matched_user.Employee_id
+                ext_username = matched_user.username
+
+                # Collect all roles for this Employee_id
+                roles_qs = ControlRoomUser.objects.using('approval_system').filter(
+                    Employee_id=employee_id,
+                    is_active=1
+                ).select_related('role')
+                all_roles = [u.role.role for u in roles_qs if u.role and u.role.role]
+
+                # Determine primary role (highest priority)
+                # Priority: VP > HOD > Advisor > Mentor > Faculty > Teacher > Staff
+                role_priority = {
+                    'Vice Principal': 0,
+                    'HOD': 1,
+                    'Advisor': 2,
+                    'Mentor': 3,
+                    'Faculty': 4,
+                    'Teacher': 5,
+                    'Staff': 6
+                }
+
+                primary_role = 'Faculty'  # Default
+                if all_roles:
+                    sorted_roles = sorted(all_roles, key=lambda r: role_priority.get(r, 99))
+                    primary_role = sorted_roles[0]
+
+                # CRITICAL: Fetch faculty name from ERP system (same table chatbot uses)
+                faculty_name = None
+                try:
+                    # Strategy 1: By employee_id (faculty_id field)
+                    faculty_record = FacultyManagementGeneralInformation.objects.filter(faculty_id=employee_id).first()
+
+                    # Strategy 2: By primary key if employee_id is numeric
+                    if not faculty_record:
+                        try:
+                            emp_pk = int(employee_id)
+                            faculty_record = FacultyManagementGeneralInformation.objects.filter(id=emp_pk).first()
+                        except (ValueError, TypeError):
+                            pass
+
+                    # Extract and validate name
+                    if faculty_record and faculty_record.name:
+                        faculty_name = faculty_record.name.strip()
+                except Exception as lookup_err:
+                    print(f"Faculty name lookup error for employee_id {employee_id}: {lookup_err}")
+
+                # Fallback to username from control_room_user only if no ERP record found
+                if not faculty_name:
+                    faculty_name = ext_username or None
+
+                # AUTHENTICATION FAILURE: Name is mandatory
+                if not faculty_name:
                     return Response({
-                        'faculty_id': employee_id,
-                        'name': faculty_name,
-                        'role': primary_role,
-                        'all_roles': all_roles
-                    })
+                        'error': f'Authentication Error: Unable to retrieve profile information for ID {employee_id}. Please contact administrator.'
+                    }, status=500)
+
+                return Response({
+                    'faculty_id': employee_id,
+                    'name': faculty_name,
+                    'role': primary_role,
+                    'all_roles': all_roles
+                })
     except Exception as e:
         print(f"External login error: {e}")
 

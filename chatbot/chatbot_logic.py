@@ -8,7 +8,7 @@ from .models import (
     InternalAssessment, Course, CourseEnrollment, AssignSubjectFaculty,
     StudentDetails, CourseOutcome, BloomsLevel, Assessments,
     Assessment_master, AssessmentMark, FacultyManagementGeneralInformation,
-    StudentDashboardStats, Attendance
+    StudentDashboardStats, Attendance, ControlRoomUser
 )
 from .knowledge_base import KnowledgeBase
 from openai import OpenAI
@@ -24,14 +24,14 @@ class ERPBot:
         """
         query = user_query.strip().lower()
         active_role = role  # Strict authority
-        
+
         # FAIL-SAFE: If active role is missing or invalid, do not answer or deny.
         if not active_role:
              return "I'm sorry, I cannot perform any actions without an active role selection from your dashboard."
-        
-        # Check if user has multiple roles (for greeting/informational context only, not permissions)
-        if all_roles is None:
-            all_roles = [active_role]
+
+        # FAIL-SAFE: We need at least a faculty_id
+        if not faculty_id:
+             return "I'm sorry, I cannot perform any actions without a valid user identity."
         
         faculty_name = None
         faculty_info = self._get_faculty_info(faculty_id)
@@ -61,6 +61,52 @@ class ERPBot:
             return self.kb.get_help_text(active_role)
 
         # 1. INTENT RECOGNITION
+        # 1.0 "My Students" intent (CA role only, unless mentor is explicitly requested)
+        my_student_phrases = [
+            "my students", "my student", "my class", "my classes",
+            "my mentees", "my mentee", "my advisees", "my advisee",
+            "my ca students", "my advisor students"
+        ]
+        if any(p in query for p in my_student_phrases):
+            target_dept = self._extract_department(query)
+            batch_match = re.search(r'\b(20\d{2})\b', query)
+            target_batch = batch_match.group(1) if batch_match else None
+
+            # If explicitly asking for mentees, return mentor list only
+            if "mentee" in query or "mentees" in query:
+                return self._handle_my_students(faculty_id, relations={"mentor"}, target_dept=target_dept, target_batch=target_batch)
+
+            # If explicitly asking for class/CA/advisor, return CA list only
+            if "class" in query or "ca" in query or "advisor" in query or "advisee" in query:
+                return self._handle_my_students(faculty_id, relations={"ca"}, target_dept=target_dept, target_batch=target_batch)
+
+            # Default: CA only
+            return self._handle_my_students(faculty_id, relations={"ca"}, target_dept=target_dept, target_batch=target_batch)
+
+        # 1.0 Subject Handling Intent
+        subject_phrases = [
+            "which subject", "which subjects", "my subjects", "my courses",
+            "subject i handle", "subjects i handle", "subject i'm handling",
+            "subjects i'm handling", "subject i am handling", "subjects i am handling",
+            "handling subject", "handling subjects", "subject handling", "subjects handling",
+            "assigned subject", "assigned subjects", "subjects assigned",
+            "what do i teach", "what am i teaching", "courses i teach", "course i teach"
+        ]
+        subject_terms = ["subject", "subjects", "course", "courses"]
+        subject_intent = any(p in query for p in subject_phrases) or (
+            any(k in query for k in ["handle", "handling", "assigned", "teach", "teaching"])
+            and any(t in query for t in subject_terms)
+        )
+        if subject_intent:
+            return self._handle_subjects_handled(faculty_id, active_role)
+
+        # 1.05 Mentee-specific intent (explicit mentor list)
+        if "mentee" in query or "mentees" in query or "mentor students" in query or "mentor student" in query:
+            target_dept = self._extract_department(query)
+            batch_match = re.search(r'\b(20\d{2})\b', query)
+            target_batch = batch_match.group(1) if batch_match else None
+            return self._handle_my_students(faculty_id, relations={"mentor"}, target_dept=target_dept, target_batch=target_batch)
+
         # 1.1 List Students Intent
         list_keywords = ["list", "show students", "get students", "who are the students", "students for", "student list"]
         if "list" in query or "students" in query:
@@ -102,126 +148,293 @@ class ERPBot:
 
     def _handle_list_students(self, faculty_id, active_role, target_role=None, target_dept=None, target_batch=None):
         """
-        Retrieves and lists students strictly based on the active role.
+        Retrieves and lists students based on the ACTIVE role scope.
+        Respects the database assignments for CA, Mentor, Subject Teacher, HOD, or VP.
         """
-        if active_role in ['Office', 'Lab', 'Staff', 'Maintenance']:
-             return "I’m unable to provide that information under your current role selection."
-
         try:
             faculty_info = self._get_faculty_info(faculty_id)
             if not faculty_info:
                 return "❌ Error: Could not find your faculty record."
 
-            # Vice Principal Logic
+            # Enforce role-based scope (do not aggregate across roles)
+            role_scope = set()
             if active_role == 'Vice Principal':
-                students = StudentDetails.objects.all()
-                filters = []
-                if target_dept:
-                    students = students.filter(department=target_dept)
-                    filters.append(target_dept.Department)
-                if target_batch:
-                    students = students.filter(batch=target_batch)
-                    filters.append(f"Batch {target_batch}")
-                
-                limit_str = f" for {', '.join(filters)}" if filters else ""
-                
-                if not students.exists():
-                     return f"No students found{limit_str}."
-
-                student_list = "\n".join([f"- {s.name} ({s.reg_no})" for s in students[:100]])
-                return f"🏫 **Vice Principal View: Student List{limit_str}**:\n\n{student_list}\n\nTotal Students: {students.count()}"
-
-            # HOD Logic
-            if active_role == 'HOD':
-                dept = faculty_info.department
-                if not dept: return "⚠️ Access Denied: No department assigned."
-                
-                # Check for special ML HOD case: If HOD of "Machine Learning" asking for "AIML"
-                # (User complained about this failing)
-                is_ml_faculty = "Machine Learning" in dept.Department
-                
-                students_qs = StudentDetails.objects.filter(department=dept)
-                
-                # If target dept is different, check for ML alias or Service HOD logic
-                if target_dept and target_dept.id != dept.id:
-                    is_ml_target = "AIML" in target_dept.Department
-                    if is_ml_faculty and is_ml_target:
-                        students_qs = StudentDetails.objects.filter(department=target_dept)
-                    else:
-                        # Standard RBAC: deny unless assigned (service logic removed for 'undo')
-                        return f"⚠️ Access Denied: As HOD of {dept.Department}, you cannot view students of {target_dept.Department}."
-                
-                if target_batch:
-                    students = students_qs.filter(batch=target_batch)
-                    if not students.exists():
-                         return f"No students found in {dept.Department} for Batch {target_batch}."
-                    
-                    student_list = "\n".join([f"- {s.name} ({s.reg_no})" for s in students[:100]])
-                    return f"🏢 **HOD View: {dept.Department} (Batch {target_batch})**:\n\n{student_list}\n\nTotal: {students.count()}"
-                
-                else:
-                    # Year-wise summary based on Batch mapping
-                    summary = [f"🏢 **HOD View: {dept.Department}**\n"]
-                    
-                    batch_to_year = {'2025': '1st Year', '2024': '2nd Year', '2023': '3rd Year', '2022': '4th Year'}
-                    year_counts = {label: 0 for label in batch_to_year.values()}
-                    other_counts = {}
-                    
-                    for s in students_qs:
-                        year_label = batch_to_year.get(s.batch)
-                        if year_label: year_counts[year_label] += 1
-                        else:
-                            b_label = f"Batch {s.batch}" if s.batch and s.batch != '0' else "Other"
-                            other_counts[b_label] = other_counts.get(b_label, 0) + 1
-                    
-                    for year_label in ['1st Year', '2nd Year', '3rd Year', '4th Year']:
-                        summary.append(f"{year_label}: {year_counts[year_label]}")
-                    for b_label, count in other_counts.items():
-                         summary.append(f"{b_label}: {count}")
-                    
-                    total = students_qs.count()
-                    summary.append(f"\n**Total Students**: {total}")
-                    return "\n".join(summary)
-
-            # Faculty/Advisor/Mentor Logic: Strict Section-Based & Assignment-Based Access
-            students_qs = StudentDetails.objects.none()
-            view_label = "Assigned Students"
-
-            if active_role == 'Mentor':
-                students_qs = StudentDetails.objects.filter(mentor_id=str(faculty_info.id))
-                view_label = "Your Mentees"
-            
+                role_scope.add('vp')
+            elif active_role == 'HOD':
+                role_scope.add('hod')
             elif active_role in ['Advisor', 'CA']:
-                students_qs = StudentDetails.objects.filter(ca_id=str(faculty_info.id))
-                view_label = "Your Class"
-
+                role_scope.add('ca')
+            elif active_role == 'Mentor':
+                role_scope.add('mentor')
             elif active_role in ['Teacher', 'Faculty']:
-                # Strictly only students in assigned batches and sections via AssignSubjectFaculty
-                assignments = AssignSubjectFaculty.objects.filter(faculty=faculty_info)
-                if not assignments.exists():
-                    return "No assigned classes found for your profile in the official records."
-                
-                # Filter students that match any of the department/batch/section assignments
-                q_objs = Q()
-                for a in assignments:
-                    q_objs |= Q(department=a.department, batch=a.batch, section=a.section)
-                
-                students_qs = StudentDetails.objects.filter(q_objs)
-                view_label = "Your Subject Students"
+                role_scope.add('subject')
+            else:
+                return "❌ Access Denied: Your current role is not permitted to list students."
 
-            if target_batch:
-                students_qs = students_qs.filter(batch=target_batch)
+            # Collect all accessible students based on different responsibilities
+            accessible_students = {} # {student_id: (student_obj, [reasons])}
+            
+            # Helper to add students
+            def add_students(queryset, reason):
+                for s in queryset:
+                    if s.id not in accessible_students:
+                        accessible_students[s.id] = {'obj': s, 'reasons': set()}
+                    accessible_students[s.id]['reasons'].add(reason)
+
+            # 1. VICE PRINCIPAL (Global Access)
+            if 'vp' in role_scope:
+                add_students(StudentDetails.objects.all(), "Vice Principal")
+
+            # 2. HOD (Department Access)
+            # Check if user is HOD (strict check)
+            if 'hod' in role_scope and (faculty_info.department): 
+                # Note: Logic assumes HOD role is significant. Using active_role as strong hint for HOD/VP.
+                # For HOD, we check their specific department.
+                dept = faculty_info.department
+                if dept:
+                    qs = StudentDetails.objects.filter(department=dept)
+                    # Handle ML/AIML Alias
+                    if "Machine Learning" in dept.Department:
+                        qs = qs | StudentDetails.objects.filter(department__Department__icontains="AIML")
+                    add_students(qs, f"HOD of {dept.Department}")
+
+            # 3. CLASS ADVISOR (CA)
+            # Find students where this faculty is the CA
+            # Match strictly by ID strings (robust check)
+            if 'ca' in role_scope:
+                ca_students = self._get_students_by_role_id(
+                    field_name="ca_id",
+                    faculty_info=faculty_info,
+                    faculty_id=faculty_id,
+                    role_names=["CA", "Advisor", "Class Advisor"]
+                )
+                add_students(ca_students, "Class Advisor")
+
+            # 4. MENTOR
+            # Find students where this faculty is the Mentor
+            if 'mentor' in role_scope:
+                mentor_students = self._get_students_by_role_id(
+                    field_name="mentor_id",
+                    faculty_info=faculty_info,
+                    faculty_id=faculty_id,
+                    role_names=["Mentor"]
+                )
+                add_students(mentor_students, "Mentor")
+
+            # 5. SUBJECT TEACHER
+            # Find students in assigned batches/sections
+            if 'subject' in role_scope:
+                assignments = AssignSubjectFaculty.objects.filter(faculty=faculty_info, is_active=1)
+                if assignments.exists():
+                    q_objs = Q()
+                    for a in assignments:
+                        q_objs |= Q(department=a.department, batch=a.batch, section=a.section)
+                    subject_students = StudentDetails.objects.filter(q_objs)
+                    add_students(subject_students, "Subject Teacher")
+
+            # --- FILTERING ---
+            final_list = []
+            
+            # If no students found at all
+            if not accessible_students:
+                 return "No students found under your assigned responsibilities for this role."
+
+            # Convert to list of objects
+            all_students_objs = [v['obj'] for k, v in accessible_students.items()]
+            
+            # Apply Request Filters (Department / Batch)
             if target_dept:
-                students_qs = students_qs.filter(department=target_dept)
+                all_students_objs = [s for s in all_students_objs if s.department_id == target_dept.id]
+            if target_batch:
+                all_students_objs = [s for s in all_students_objs if s.batch == target_batch]
 
-            if not students_qs.exists():
-                 return f"No students found under your role access for the specified criteria."
+            # Sort by name
+            all_students_objs.sort(key=lambda s: s.name)
 
-            student_list = "\n".join([f"- {s.name} ({s.reg_no}) [Sec: {s.section}]" for s in students_qs[:100]])
-            return f"👨‍🎓 **{view_label}**:\n\n{student_list}\n\nTotal: {students_qs.count()}"
+            if not all_students_objs:
+                 return f"No students matched your criteria within your accessible scope."
+
+            # Format Output
+            student_lines = []
+            for s in all_students_objs[:100]: # Limit to 100
+                reasons = accessible_students[s.id]['reasons']
+                # Determine relationship label
+                rel_label = ""
+                if "Vice Principal" in reasons: rel_label = ""
+                elif "Class Advisor" in reasons: rel_label = "[My Class]"
+                elif "Mentor" in reasons: rel_label = "[Mentee]"
+                elif "Subject Teacher" in reasons: rel_label = "[Student]"
+                elif "HOD" in reasons: rel_label = "" # Implicit for HOD
+                
+                student_lines.append(f"- {s.name} ({s.reg_no}) {rel_label}")
+
+            count_str = f"Total: {len(all_students_objs)}"
+            if len(all_students_objs) > 100: count_str += " (Showing first 100)"
+            
+            header = "👨‍🎓 **Student List**"
+            if target_batch: header += f" (Batch {target_batch})"
+            
+            return f"{header}:\n\n" + "\n".join(student_lines) + f"\n\n{count_str}"
 
         except Exception as e:
             return f"❌ Error retrieving student list: {str(e)}"
+
+    def _handle_my_students(self, faculty_id, relations=None, target_dept=None, target_batch=None):
+        """
+        Lists students strictly based on CA and/or Mentor assignments.
+        This is used for queries like "my students", "my class", "my mentees".
+        """
+        try:
+            faculty_info = self._get_faculty_info(faculty_id)
+            if not faculty_info:
+                return "❌ Error: Could not find your faculty record."
+
+            relations = relations or {"ca", "mentor"}
+
+            accessible_students = {}
+
+            def add_students(queryset, reason):
+                for s in queryset:
+                    if s.id not in accessible_students:
+                        accessible_students[s.id] = {'obj': s, 'reasons': set()}
+                    accessible_students[s.id]['reasons'].add(reason)
+
+            if "ca" in relations:
+                ca_students = self._get_students_by_role_id(
+                    field_name="ca_id",
+                    faculty_info=faculty_info,
+                    faculty_id=faculty_id,
+                    role_names=["CA", "Advisor", "Class Advisor"]
+                )
+                add_students(ca_students, "Class Advisor")
+
+            if "mentor" in relations:
+                mentor_students = self._get_students_by_role_id(
+                    field_name="mentor_id",
+                    faculty_info=faculty_info,
+                    faculty_id=faculty_id,
+                    role_names=["Mentor"]
+                )
+                add_students(mentor_students, "Mentor")
+
+            if not accessible_students:
+                subject_assignments = AssignSubjectFaculty.objects.filter(faculty=faculty_info, is_active=1)
+                if subject_assignments.exists():
+                    if relations == {"mentor"}:
+                        return "No students found under your Mentor role ID. If you want students from your subject handling, ask: 'list subject students'."
+                    if relations == {"ca"}:
+                        return "No students found under your CA role ID. If you want students from your subject handling, ask: 'list subject students'."
+                    return "No students found under your CA/Mentor assignments. If you want students from your subject handling, ask: 'list subject students'."
+                if relations == {"mentor"}:
+                    return "No students found under your Mentor role ID."
+                if relations == {"ca"}:
+                    return "No students found under your CA role ID."
+                return "No students found under your CA/Mentor assignments."
+
+            all_students_objs = [v['obj'] for k, v in accessible_students.items()]
+            if target_dept:
+                all_students_objs = [s for s in all_students_objs if s.department_id == target_dept.id]
+            if target_batch:
+                all_students_objs = [s for s in all_students_objs if s.batch == target_batch]
+
+            all_students_objs.sort(key=lambda s: s.name)
+
+            if not all_students_objs:
+                return "No students matched your criteria within your CA/Mentor scope."
+
+            student_lines = []
+            for s in all_students_objs[:100]:
+                reasons = accessible_students[s.id]['reasons']
+                rel_label = ""
+                if "Class Advisor" in reasons and "Mentor" in reasons:
+                    rel_label = "[My Class, Mentee]"
+                elif "Class Advisor" in reasons:
+                    rel_label = "[My Class]"
+                elif "Mentor" in reasons:
+                    rel_label = "[Mentee]"
+
+                student_lines.append(f"- {s.name} ({s.reg_no}) {rel_label}")
+
+            count_str = f"Total: {len(all_students_objs)}"
+            if len(all_students_objs) > 100:
+                count_str += " (Showing first 100)"
+
+            if relations == {"mentor"}:
+                header = "👨‍🎓 **My Mentees**"
+            elif relations == {"ca"}:
+                header = "👨‍🎓 **My Students (CA)**"
+            else:
+                header = "👨‍🎓 **My Students**"
+            if target_batch:
+                header += f" (Batch {target_batch})"
+
+            return f"{header}:\n\n" + "\n".join(student_lines) + f"\n\n{count_str}"
+
+        except Exception as e:
+            return f"❌ Error retrieving my students: {str(e)}"
+
+    def _handle_subjects_handled(self, faculty_id, active_role):
+        """
+        Lists the subjects a faculty member is currently handling, based strictly on DB assignments.
+        """
+        try:
+            faculty_info = self._get_faculty_info(faculty_id)
+            if not faculty_info:
+                return "❌ Error: Could not find your faculty record."
+
+            allowed_roles = ['Vice Principal', 'HOD', 'Advisor', 'CA', 'Mentor', 'Teacher', 'Faculty']
+            if active_role not in allowed_roles:
+                return "❌ Access Denied: Your current role is not permitted to view subject handling."
+
+            assignments = AssignSubjectFaculty.objects.filter(is_active=1).filter(
+                Q(faculty=faculty_info) |
+                Q(faculty__faculty_id=faculty_id) |
+                Q(faculty__id=faculty_id)
+            ).select_related('course', 'department', 'regulation')
+
+            if not assignments.exists():
+                return "No active subject assignments found for your profile."
+
+            seen = set()
+            lines = []
+            ordered = assignments.order_by(
+                'department__Department', 'batch', 'section', 'course__course_code', 'course__title'
+            )
+            for a in ordered:
+                course_title = a.course.title if a.course else "Unknown Course"
+                course_code = a.course.course_code if a.course and a.course.course_code else ""
+                dept_name = None
+                if a.department and a.department.Department:
+                    dept_name = a.department.Department
+                elif a.course and a.course.department and a.course.department.Department:
+                    dept_name = a.course.department.Department
+                else:
+                    dept_name = "N/A"
+
+                batch = a.batch or "N/A"
+                section = a.section or "N/A"
+                academic_year = a.academic_year or "N/A"
+                regulation = a.regulation.year if a.regulation else "N/A"
+
+                key = (course_title, course_code, dept_name, batch, section, academic_year, regulation)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                subject_label = f"{course_title}"
+                if course_code:
+                    subject_label += f" ({course_code})"
+
+                lines.append(
+                    f"- {subject_label} | Dept: {dept_name} | Batch: {batch} | Section: {section} | AY: {academic_year} | Reg: {regulation}"
+                )
+
+            header = "📚 **Subjects You Are Handling**"
+            count_str = f"Total: {len(lines)}"
+            return f"{header}:\n\n" + "\n".join(lines) + f"\n\n{count_str}"
+
+        except Exception as e:
+            return f"❌ Error retrieving subject assignments: {str(e)}"
 
     def _handle_student_query(self, faculty_id, student_reg_no, query, active_role):
         try:
@@ -257,12 +470,19 @@ class ERPBot:
                         ).exists()
                         if is_authorized:
                             auth_reason = f"Authorized as Service HOD: Viewing {faculty_info.department.Department} subjects for {student.department.Department} student."
-            
             elif active_role in ['Advisor', 'CA']: 
-                is_authorized = (str(student.ca_id) == str(faculty_info.id))
+                ca_id_str = str(student.ca_id).strip() if student.ca_id else ""
+                _, ca_candidate_ids = self._get_candidate_ids(
+                    faculty_id, faculty_info, ["CA", "Advisor", "Class Advisor"]
+                )
+                is_authorized = (ca_id_str in ca_candidate_ids)
             
             elif active_role == 'Mentor': 
-                is_authorized = (str(student.mentor_id) == str(faculty_info.id))
+                mentor_id_str = str(student.mentor_id).strip() if student.mentor_id else ""
+                _, mentor_candidate_ids = self._get_candidate_ids(
+                    faculty_id, faculty_info, ["Mentor"]
+                )
+                is_authorized = (mentor_id_str in mentor_candidate_ids)
             
             elif active_role in ['Teacher', 'Faculty']:
                 # SMART ROLE DETECTION: Check if this teacher is actually the CA for this student
@@ -271,8 +491,11 @@ class ERPBot:
                 ca_id_str = str(student.ca_id).strip() if student.ca_id else ""
                 faculty_pk = str(faculty_info.id)
                 faculty_emp_id = str(faculty_info.faculty_id) if faculty_info.faculty_id else ""
+                _, ca_candidate_ids = self._get_candidate_ids(
+                    faculty_id, faculty_info, ["CA", "Advisor", "Class Advisor"]
+                )
                 
-                is_ca_for_student = (ca_id_str == faculty_pk) or (ca_id_str == faculty_emp_id and faculty_emp_id != "")
+                is_ca_for_student = (ca_id_str in ca_candidate_ids)
                 
                 if is_ca_for_student:
                     # Auto-elevate to CA access
@@ -280,28 +503,40 @@ class ERPBot:
                     active_role = 'CA'  # Upgrade role to CA for this query
                     auth_reason = f"Auto-elevated to Class Advisor access (you are CA for this student)"
                 else:
-                    # Standard teacher authorization check
-                    assignments = AssignSubjectFaculty.objects.filter(
-                        faculty=faculty_info,
-                        department=student.department,
-                        batch=student.batch,
-                        section=student.section
+                    # Mentor auto-elevation (if they are mentor for this student)
+                    mentor_id_str = str(student.mentor_id).strip() if student.mentor_id else ""
+                    _, mentor_candidate_ids = self._get_candidate_ids(
+                        faculty_id, faculty_info, ["Mentor"]
                     )
-                    
-                    if assignments.exists():
-                        is_authorized = True
-                    else:
-                        # HEURISTIC FALLBACK: If faculty is from a Service Department (Maths, Physics, etc.)
-                        # grant access to the profile but marks will be filtered later.
-                        service_depts = ['Maths', 'Physics', 'Chemistry', 'English', 'Physical Education']
-                        faculty_dept_name = faculty_info.department.Department if faculty_info.department else ""
-                        
-                        if any(sd in faculty_dept_name for sd in service_depts):
-                            is_authorized = True
-                            auth_reason = f"Authorized as Service Faculty ({faculty_dept_name})"
-                        else:
-                            auth_reason = f"Access Denied: You are not assigned to {student.department.Department} - Section {student.section}."
+                    is_mentor_for_student = (mentor_id_str in mentor_candidate_ids)
 
+                    if is_mentor_for_student:
+                        is_authorized = True
+                        active_role = 'Mentor'  # Upgrade role to Mentor for this query
+                        auth_reason = "Auto-elevated to Mentor access (you are Mentor for this student)"
+                    else:
+                        # Standard teacher authorization check
+                        assignments = AssignSubjectFaculty.objects.filter(
+                            faculty=faculty_info,
+                            department=student.department,
+                            batch=student.batch,
+                            section=student.section
+                        )
+                        
+                        if assignments.exists():
+                            is_authorized = True
+                        else:
+                            # HEURISTIC FALLBACK: If faculty is from a Service Department (Maths, Physics, etc.)
+                            # grant access to the profile but marks will be filtered later.
+                            service_depts = ['Maths', 'Physics', 'Chemistry', 'English', 'Physical Education']
+                            faculty_dept_name = faculty_info.department.Department if faculty_info.department else ""
+                            
+                            if any(sd in faculty_dept_name for sd in service_depts):
+                                is_authorized = True
+                                auth_reason = f"Authorized as Service Faculty ({faculty_dept_name})"
+                            else:
+                                auth_reason = f"Access Denied: You are not assigned to {student.department.Department} - Section {student.section}."
+            
             if not is_authorized:
                 return auth_reason or "I’m unable to provide that information under your current role selection."
 
@@ -363,7 +598,11 @@ class ERPBot:
             
             # ===== DETERMINE RESPONSE TYPE =====
             # Check if user is asking for detailed performance analysis or just basic info
-            analysis_keywords = ['performance', 'analyze', 'analysis', 'analyze', 'report', 'evaluate', 'assessment']
+            analysis_keywords = [
+                'performance', 'analyze', 'analysis', 'report', 'evaluate', 'assessment',
+                'recommend', 'recommendation', 'suggest', 'suggestion', 'advice',
+                'improve', 'improvement', 'guidance', 'plan', 'action plan'
+            ]
             wants_analysis = any(keyword in query_lower for keyword in analysis_keywords)
             
             # For CA, HOD, and VP: Default to profile view unless analysis is explicitly requested
@@ -482,6 +721,55 @@ Conclusion:
     def _handle_marks_chart(self, faculty_id, student_identifiers, query, active_role):
         return {"text": "📊 Comparison chart generating...", "type": "chart", "data": {"Sample": 80}}
 
+    def _get_role_ids(self, faculty_id, role_names):
+        role_ids = set()
+        try:
+            base_qs = ControlRoomUser.objects.using('approval_system').filter(
+                Employee_id=faculty_id,
+                is_active=1
+            )
+            if role_names:
+                qs = base_qs.select_related('role').filter(role__role__in=role_names)
+                for u in qs:
+                    if u.id is not None:
+                        role_ids.add(str(u.id))
+        except Exception:
+            pass
+        return role_ids
+
+    def _get_candidate_ids(self, faculty_id, faculty_info, role_names):
+        role_ids = self._get_role_ids(faculty_id, role_names)
+        candidate_ids = set(role_ids)
+        if faculty_info:
+            if faculty_info.id is not None:
+                candidate_ids.add(str(faculty_info.id))
+            if faculty_info.faculty_id:
+                candidate_ids.add(str(faculty_info.faculty_id))
+        if faculty_id:
+            candidate_ids.add(str(faculty_id))
+        return role_ids, candidate_ids
+
+    def _get_students_by_role_id(self, field_name, faculty_info, faculty_id, role_names):
+        role_ids = self._get_role_ids(faculty_id, role_names)
+        if role_ids:
+            qs = StudentDetails.objects.filter(**{f"{field_name}__in": list(role_ids)})
+            if qs.exists():
+                return qs
+
+        fallback_ids = set()
+        if faculty_info:
+            if faculty_info.id is not None:
+                fallback_ids.add(str(faculty_info.id))
+            if faculty_info.faculty_id:
+                fallback_ids.add(str(faculty_info.faculty_id))
+        if not fallback_ids and faculty_id:
+            fallback_ids.add(str(faculty_id))
+
+        if fallback_ids:
+            return StudentDetails.objects.filter(**{f"{field_name}__in": list(fallback_ids)})
+
+        return StudentDetails.objects.none()
+
     def _extract_department(self, query):
         clean_query = re.sub(r'[^a-zA-Z0-9\s]', ' ', query.lower())
         aliases = {'ml': 'AIML', 'ai': 'Artificial', 'cse': 'Engineering', 'cs': 'Engineering', 'it': 'Information'}
@@ -497,19 +785,22 @@ Conclusion:
         try:
             f = FacultyManagementGeneralInformation.objects.filter(faculty_id=faculty_id).first()
             if f: return f
-            # Legacy/Approval System lookup
-            from django.db import connections
-            with connections['approval_system'].cursor() as cursor:
-                cursor.execute("SELECT u.username, d.department FROM control_room_user u JOIN control_room_department d ON u.Department_id = d.id WHERE u.Employee_id = %s", [faculty_id])
-                row = cursor.fetchone()
-                if row:
-                    name, dept_name = row[0], row[1]
-                    dept = Add_Department.objects.filter(Department__iexact=dept_name).first()
-                    if not dept and "Machine Learning" in dept_name:
+            # Legacy/Approval System lookup (ORM only)
+            try:
+                cr_user = ControlRoomUser.objects.using('approval_system').select_related('department').filter(
+                    Employee_id=faculty_id
+                ).first()
+                if cr_user:
+                    name = cr_user.username
+                    dept_name = cr_user.department.department if cr_user.department else None
+                    dept = Add_Department.objects.filter(Department__iexact=dept_name).first() if dept_name else None
+                    if not dept and dept_name and "Machine Learning" in dept_name:
                         dept = Add_Department.objects.filter(Department__icontains="AIML").first()
                     class TransientFaculty:
                         def __init__(self, name, dept): self.name, self.department, self.id = name, dept, 0
                     return TransientFaculty(name, dept)
+            except Exception:
+                pass
         except: pass
         return None
 

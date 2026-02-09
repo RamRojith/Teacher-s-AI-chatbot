@@ -346,7 +346,7 @@ class ControlRoomDepartment(models.Model):
 
     class Meta:
         managed = False
-        db_table = 'add_department'
+        db_table = 'control_room_department'
         app_label = 'chatbot'
 
 class ControlRoomUser(models.Model):
@@ -355,7 +355,7 @@ class ControlRoomUser(models.Model):
     username = models.CharField(max_length=255)
     password = models.CharField(max_length=255)
     role = models.ForeignKey(ControlRoomRole, on_delete=models.DO_NOTHING, db_column='role_id')
-    department = models.ForeignKey(ControlRoomDepartment, on_delete=models.DO_NOTHING, db_column='dept_id', null=True)
+    department = models.ForeignKey(ControlRoomDepartment, on_delete=models.DO_NOTHING, db_column='Department_id', null=True)
     is_active = models.IntegerField()
 
     class Meta:
